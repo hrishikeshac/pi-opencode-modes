@@ -125,26 +125,6 @@ Create a structured numbered plan under a "## Plan" header:
 **Do NOT make any changes.** When your plan is ready, the user will switch to
 Build mode to implement it.`;
 
-// ─── Build Mode System Prompt ─────────────────────────────────────────────
-
-const BUILD_SYSTEM_PROMPT = `You are in **BUILD MODE** — implementation and execution.
-
-**Your role:** Implement the plan with focused, correct changes. You have full
-tool access including edit, write, and bash.
-
-**Rules:**
-- Keep scope tight. Do exactly what was asked, no more.
-- Read files before editing to understand current state.
-- Make surgical edits. Prefer edit over write for existing files.
-- Explain your reasoning briefly before each change.
-- Run tests or type checks after changes if the project supports them.
-- If you encounter unexpected complexity, STOP and explain rather than
-  hacking around it.
-
-**After completing changes:**
-- Summarize what was done.
-- Note any follow-up work or tests that should be added.`;
-
 // ─── Type Guards ──────────────────────────────────────────────────────────
 
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
@@ -404,14 +384,12 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 	// ── System Prompt Injection ─────────────────────────────────────────────
 
 	pi.on("before_agent_start", async () => {
-		const prompt = currentMode === MODE_PLAN
-			? PLAN_SYSTEM_PROMPT
-			: BUILD_SYSTEM_PROMPT;
+		if (currentMode !== MODE_PLAN) return; // Build mode = Pi's natural state, no extra prompt
 
 		return {
 			message: {
 				customType: "opencode-mode-context",
-				content: prompt,
+				content: PLAN_SYSTEM_PROMPT,
 				display: false,
 			},
 		};
