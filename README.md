@@ -12,7 +12,8 @@ Press **`Shift+Tab`** to switch modes.
 | Write tools (edit/write) | Blocked | Full access |
 | Destructive bash (rm, git write, etc.) | Blocked | Full access |
 | System prompt | Planning & analysis focused | Implementation & execution focused |
-| Per-mode model | Configurable | Configurable |
+| Per-mode model | Configurable, persists per mode | Configurable, persists per mode |
+| Thinking level | `Alt+T` to cycle, `/thinking` to set | `Alt+T` to cycle, `/thinking` to set |
 
 ## Installation
 
@@ -21,14 +22,13 @@ Press **`Shift+Tab`** to switch modes.
    cp opencode-modes.ts ~/.pi/agent/extensions/
    ```
 
-2. Bind `app.thinking.cycle` away from `Shift+Tab` (or it conflicts). Add to `~/.pi/agent/keybindings.json`:
-   ```json
-   {
-     "app.thinking.cycle": ["ctrl+shift+t"]
-   }
-   ```
+2. Reload Pi: `/reload`
 
-3. Reload Pi: `/reload`
+> **Note:** `Shift+Tab` is now used for mode toggling. To avoid conflicts, make sure Pi's built-in `app.thinking.cycle` is not bound to `Shift+Tab`. If needed, rebind it via `~/.pi/agent/keybindings.json`:
+> ```json
+> { "app.thinking.cycle": ["ctrl+shift+t"] }
+> ```
+> Or use the built-in `Alt+T` shortcut this extension provides.
 
 ## Configuration
 
@@ -70,8 +70,15 @@ Project-local configs at `.pi/opencode-modes.json` merge on top of the global on
 | Toggle mode | `Shift+Tab` |
 | Switch to Plan | `/plan` |
 | Switch to Build | `/build` |
-| Show current mode | `/mode` |
+| Show current mode + model | `/mode` |
+| Cycle thinking level | `Alt+T` |
+| Set thinking level | `/thinking [off/low/medium/high/xhigh]` |
+| Show thinking level | `/thinking` (no args) |
 | Start in Plan mode | `pi --mode plan` |
+
+### Model persistence
+
+When you manually change the model in a mode (via `/model` or model cycling), that choice is remembered. Switching modes and back restores your previous model selection for each mode. Selections survive session restarts.
 
 ## How it works
 
@@ -80,8 +87,10 @@ This is a Pi extension (`opencode-modes.ts`) placed in `~/.pi/agent/extensions/`
 - **Intercept tool calls** — blocks `edit`/`write` and destructive bash in Plan mode
 - **Manage tools** — switches the active toolset via `pi.setActiveTools()`
 - **Inject system prompts** — injects mode-specific instructions before each turn
-- **Switch models** — calls `pi.setModel()` when a per-mode model is configured
-- **Keyboard shortcut** — registers `Shift+Tab` via `pi.registerShortcut()`
+- **Switch models** — calls `pi.setModel()` when a per-mode model is configured; remembers your manual model choice per mode
+- **Cycle thinking** — `Alt+T` to cycle thinking levels, `/thinking` command for direct setting
+- **Status display** — shows current mode, model, and thinking level in the status bar
+- **Keyboard shortcuts** — registers `Shift+Tab` (mode toggle) and `Alt+T` (thinking cycle)
 
 Zero external dependencies — only depends on the Pi core APIs (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`).
 

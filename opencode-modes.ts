@@ -36,7 +36,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key } from "@earendil-works/pi-tui";
+import { Key, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -57,6 +57,10 @@ const WRITE_TOOLS = new Set(["edit", "write"]);
 
 // All tools this extension manages (so we don't interfere with custom tools)
 const MANAGED_TOOLS = new Set([...PLAN_TOOLS, ...BUILD_TOOLS]);
+
+// Thinking level cycle order (skipping minimal and max for quick toggling)
+const THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh"] as const;
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 // Destructive bash patterns blocked in Plan mode
 const DESTRUCTIVE_PATTERNS = [
@@ -228,6 +232,18 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 	let toolsBeforeMode: string[] | undefined;
 	let config: OpenCodeModesConfig = {};
 
+	// Per-mode model tracking (persisted as "provider/modelId" strings)
+	const modeModels: Partial<Record<Mode, string>> = {};
+
+	// Flag to distinguish config-driven model changes from user-driven ones
+	let _applyingConfigModel = false;
+
+	// Per-mode thinking level tracking
+	const modeThinkingLevels: Partial<Record<Mode, string>> = {};
+
+	// Flag to distinguish config-driven thinking level changes from user-driven ones
+	let _applyingConfigThinking = false;
+
 	// ── Flag ────────────────────────────────────────────────────────────────
 
 	pi.registerFlag("mode", {
@@ -274,6 +290,8 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		pi.appendEntry("opencode-mode-state", {
 			mode: currentMode,
 			toolsBeforeMode,
+			modeModels: Object.fromEntries(Object.entries(modeModels)),
+			modeThinkingLevels: Object.fromEntries(Object.entries(modeThinkingLevels)),
 		});
 	}
 
@@ -291,7 +309,9 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 			const model = ctx.modelRegistry.find(provider, modelId);
 			if (model) {
+				_applyingConfigModel = true;
 				const success = await pi.setModel(model);
+				_applyingConfigModel = false;
 				if (!success) {
 					ctx.ui.notify(
 						`No API key available for ${modeConfig.model} (${mode} mode)`,
@@ -308,7 +328,9 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 		// Switch thinking level if configured
 		if (modeConfig.thinkingLevel) {
+			_applyingConfigThinking = true;
 			pi.setThinkingLevel(modeConfig.thinkingLevel as any);
+			_applyingConfigThinking = false;
 		}
 	}
 
@@ -316,6 +338,12 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 	async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
 		if (mode === currentMode) return;
+
+		// Save departing mode's current model and thinking level
+		if (ctx.model) {
+			modeModels[currentMode] = `${ctx.model.provider}/${ctx.model.id}`;
+		}
+		modeThinkingLevels[currentMode] = pi.getThinkingLevel();
 
 		currentMode = mode;
 
@@ -327,8 +355,45 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 			ctx.ui.notify("▶ Build mode — full tool access for implementation.");
 		}
 
-		await applyModeModel(mode, ctx);
+		// Restore model for arriving mode, or apply config default
+		const storedModelId = modeModels[mode];
+		if (storedModelId) {
+			const [provider, modelId] = storedModelId.split("/", 2);
+			const model = ctx.modelRegistry.find(provider, modelId);
+			if (model) {
+				await pi.setModel(model);
+			} else {
+				// Stored model no longer available — apply config default
+				await applyModeModel(mode, ctx);
+			}
+		} else {
+			await applyModeModel(mode, ctx);
+		}
+
+		// Always save what was actually set for this mode
+		if (ctx.model) {
+			modeModels[mode] = `${ctx.model.provider}/${ctx.model.id}`;
+		}
+
+		// Restore thinking level for arriving mode, or apply config default
+		const storedThinking = modeThinkingLevels[mode];
+		if (storedThinking) {
+			_applyingConfigThinking = true;
+			pi.setThinkingLevel(storedThinking as any);
+			_applyingConfigThinking = false;
+		} else {
+			const modeConfig = mode === MODE_PLAN ? config.plan : config.build;
+			if (modeConfig?.thinkingLevel) {
+				_applyingConfigThinking = true;
+				pi.setThinkingLevel(modeConfig.thinkingLevel as any);
+				_applyingConfigThinking = false;
+			}
+		}
+		// Always save what was actually set for this mode
+		modeThinkingLevels[mode] = pi.getThinkingLevel();
+
 		updateStatus(ctx);
+		updateThinkingStatus(ctx);
 		persistState();
 	}
 
@@ -378,6 +443,25 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		}
 	});
 
+	// ── Model change tracking ──────────────────────────────────────────────
+
+	pi.on("model_select", async (event) => {
+		// Save user-initiated model changes (skip config-driven changes)
+		if (!_applyingConfigModel && event.model) {
+			modeModels[currentMode] = `${event.model.provider}/${event.model.id}`;
+		}
+	});
+
+	// ── Thinking level change tracking ───────────────────────────────────────
+
+	pi.on("thinking_level_select", async (event, ctx) => {
+		updateThinkingStatus(ctx);
+		// Save user-initiated changes (skip config-driven changes)
+		if (!_applyingConfigThinking && event.level) {
+			modeThinkingLevels[currentMode] = event.level;
+		}
+	});
+
 	// ── Clean up stale mode context when not active ─────────────────────────
 
 	pi.on("context", async (event) => {
@@ -423,7 +507,53 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		description: "Show current mode",
 		handler: async (_args, ctx) => {
 			const modeLabel = currentMode === MODE_PLAN ? "⏸ Plan" : "▶ Build";
-			ctx.ui.notify(`Current mode: ${modeLabel}`, "info");
+			const modelLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+			ctx.ui.notify(`Current mode: ${modeLabel} | Model: ${modelLabel}`, "info");
+		},
+	});
+
+	// ── Thinking Level ──────────────────────────────────────────────────────
+
+	function cycleThinking(ctx: ExtensionContext): void {
+		const current = pi.getThinkingLevel();
+		const idx = THINKING_LEVELS.indexOf(current as ThinkingLevel);
+		const next = THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length];
+		pi.setThinkingLevel(next);
+		ctx.ui.notify(`Thinking level: ${next}`, "info");
+		updateThinkingStatus(ctx);
+	}
+
+	function updateThinkingStatus(ctx: ExtensionContext): void {
+		const level = pi.getThinkingLevel();
+		ctx.ui.setStatus("opencode-thinking", `🧠 ${level}`);
+	}
+
+	pi.registerShortcut("alt+t", {
+		description: "Cycle thinking level",
+		handler: async (ctx) => {
+			cycleThinking(ctx);
+		},
+	});
+
+	pi.registerCommand("thinking", {
+		description: "Set thinking level (off/low/medium/high/xhigh) or show current",
+		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+			const items = THINKING_LEVELS.map((l) => ({
+				value: l,
+				label: l,
+			}));
+			if (!prefix) return items;
+			const filtered = items.filter((i) => i.value.startsWith(prefix));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args, ctx) => {
+			if (!args || !(THINKING_LEVELS as readonly string[]).includes(args)) {
+				ctx.ui.notify(`Current thinking level: ${pi.getThinkingLevel()}`, "info");
+				return;
+			}
+			pi.setThinkingLevel(args as ThinkingLevel);
+			ctx.ui.notify(`Thinking level: ${args}`, "info");
+			updateThinkingStatus(ctx);
 		},
 	});
 
@@ -455,7 +585,14 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 				(e: { type: string; customType?: string }) =>
 					e.type === "custom" && e.customType === "opencode-mode-state",
 			)
-			.pop() as { data?: { mode?: Mode; toolsBeforeMode?: string[] } } | undefined;
+			.pop() as {
+				data?: {
+					mode?: Mode;
+					toolsBeforeMode?: string[];
+					modeModels?: Record<string, string>;
+					modeThinkingLevels?: Record<string, string>;
+				};
+			} | undefined;
 
 		if (stateEntry?.data) {
 			const restored = stateEntry.data;
@@ -464,6 +601,20 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 			}
 			if (restored.toolsBeforeMode) {
 				toolsBeforeMode = restored.toolsBeforeMode;
+			}
+			if (restored.modeModels) {
+				for (const [key, val] of Object.entries(restored.modeModels)) {
+					if (key === MODE_PLAN || key === MODE_BUILD) {
+						modeModels[key] = val;
+					}
+				}
+			}
+			if (restored.modeThinkingLevels) {
+				for (const [key, val] of Object.entries(restored.modeThinkingLevels)) {
+					if (key === MODE_PLAN || key === MODE_BUILD) {
+						modeThinkingLevels[key] = val;
+					}
+				}
 			}
 		}
 
@@ -476,9 +627,46 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 		// Apply per-mode model on initial load
 		if (currentMode === MODE_PLAN || currentMode === MODE_BUILD) {
-			await applyModeModel(currentMode, ctx);
+			const storedModelId = modeModels[currentMode];
+			if (storedModelId && ctx.modelRegistry) {
+				const [provider, modelId] = storedModelId.split("/", 2);
+				const model = ctx.modelRegistry.find(provider, modelId);
+				if (model) {
+					_applyingConfigModel = true;
+					await pi.setModel(model);
+					_applyingConfigModel = false;
+				} else {
+					// Stored model no longer available — apply config default
+					await applyModeModel(currentMode, ctx);
+				}
+			} else {
+				await applyModeModel(currentMode, ctx);
+			}
+
+			// Always save what was actually set for this mode
+			if (ctx.model) {
+				modeModels[currentMode] = `${ctx.model.provider}/${ctx.model.id}`;
+			}
+		}
+
+		// Apply per-mode thinking level on initial load
+		if (currentMode === MODE_PLAN || currentMode === MODE_BUILD) {
+			const storedThinking = modeThinkingLevels[currentMode];
+			if (storedThinking) {
+				_applyingConfigThinking = true;
+				pi.setThinkingLevel(storedThinking as any);
+				_applyingConfigThinking = false;
+			} else {
+				const modeConfig = currentMode === MODE_PLAN ? config.plan : config.build;
+				if (modeConfig?.thinkingLevel) {
+					_applyingConfigThinking = true;
+					pi.setThinkingLevel(modeConfig.thinkingLevel as any);
+					_applyingConfigThinking = false;
+				}
+			}
 		}
 
 		updateStatus(ctx);
+		updateThinkingStatus(ctx);
 	});
 }
