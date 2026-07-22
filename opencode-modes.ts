@@ -15,11 +15,11 @@
  *   {
  *     "plan": {
  *       "model": "opencode/deepseek-v4-flash-free",
- *       "thinkingLevel": "high"
+ *       "thinkingLevel": "max"
  *     },
  *     "build": {
  *       "model": "opencode/deepseek-v4-flash-free",
- *       "thinkingLevel": "high"
+ *       "thinkingLevel": "off"
  *     }
  *   }
  *

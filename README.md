@@ -55,11 +55,11 @@ If you want different starting model/thinking level the first time you enter eac
 {
   "plan": {
     "model": "opencode/deepseek-v4-flash-free",
-    "thinkingLevel": "high"
+    "thinkingLevel": "max"
   },
   "build": {
-    "model": "anthropic/claude-sonnet-4-5",
-    "thinkingLevel": "low"
+    "model": "opencode/deepseek-v4-flash-free",
+    "thinkingLevel": "off"
   }
 }
 ```
