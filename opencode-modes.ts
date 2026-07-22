@@ -1,0 +1,484 @@
+/**
+ * OpenCode-style Plan & Build Modes for Pi
+ *
+ * Toggle between Plan mode (read-only analysis/planning) and Build mode
+ * (full implementation access) using SHIFT+TAB.
+ *
+ * - Plan mode: read-only tools, planning-focused system prompt, blocks edits
+ * - Build mode: full tool access, implementation-focused system prompt
+ *
+ * Configure per-mode models in:
+ *   ~/.pi/agent/opencode-modes.json  (user global)
+ *   .pi/opencode-modes.json          (project-local, takes precedence)
+ *
+ * Example config:
+ *   {
+ *     "plan": {
+ *       "model": "opencode/deepseek-v4-flash-free",
+ *       "thinkingLevel": "high"
+ *     },
+ *     "build": {
+ *       "model": "opencode/deepseek-v4-flash-free",
+ *       "thinkingLevel": "high"
+ *     }
+ *   }
+ *
+ * Usage:
+ *   SHIFT+TAB — toggle between Plan and Build modes
+ *   /plan     — switch to Plan mode
+ *   /build    — switch to Build mode
+ *   /mode     — show current mode
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Key } from "@earendil-works/pi-tui";
+
+// ─── Constants ────────────────────────────────────────────────────────────
+
+const MODE_PLAN = "plan" as const;
+const MODE_BUILD = "build" as const;
+type Mode = typeof MODE_PLAN | typeof MODE_BUILD;
+
+// Config file names
+const USER_CONFIG_FILE = join(getAgentDir(), "opencode-modes.json");
+const PROJECT_CONFIG_NAME = "opencode-modes.json";
+
+// Tools available in each mode
+const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "subagent"];
+const BUILD_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent"];
+
+// Write tools blocked in Plan mode
+const WRITE_TOOLS = new Set(["edit", "write"]);
+
+// All tools this extension manages (so we don't interfere with custom tools)
+const MANAGED_TOOLS = new Set([...PLAN_TOOLS, ...BUILD_TOOLS]);
+
+// Destructive bash patterns blocked in Plan mode
+const DESTRUCTIVE_PATTERNS = [
+	/\brm\b/i,
+	/\brmdir\b/i,
+	/\bmv\b/i,
+	/\bcp\b/i,
+	/\bmkdir\b/i,
+	/\btouch\b/i,
+	/\bchmod\b/i,
+	/\bchown\b/i,
+	/\btee\b/i,
+	/\btruncate\b/i,
+	/\bdd\b/i,
+	/\bshred\b/i,
+	/(^|[^<])>(?!>)/,
+	/>>/,
+	/\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
+	/\byarn\s+(add|remove|install|publish)/i,
+	/\bpnpm\s+(add|remove|install|publish)/i,
+	/\bpip\s+(install|uninstall)/i,
+	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
+	/\bbrew\s+(install|uninstall|upgrade)/i,
+	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
+	/\bsudo\b/i,
+	/\bsu\b/i,
+	/\bkill\b/i,
+	/\bpkill\b/i,
+	/\bkillall\b/i,
+	/\breboot\b/i,
+	/\bshutdown\b/i,
+	/\bsystemctl\s+(start|stop|restart|enable|disable)/i,
+	/\bservice\s+\S+\s+(start|stop|restart)/i,
+	/\b(vim?|nano|emacs|code|subl)\b/i,
+];
+
+// ─── Plan Mode System Prompt ──────────────────────────────────────────────
+
+const PLAN_SYSTEM_PROMPT = `You are in **PLAN MODE** — read-only analysis and planning.
+
+**Your role:** Deeply understand the problem, explore the codebase, and create
+a clear, actionable plan before any code is written.
+
+**Rules:**
+- You CANNOT edit or write files. The edit, write, and destructive bash tools
+  are disabled.
+- Read files thoroughly. Use offset/limit to navigate, but ensure you get
+  complete understanding.
+- Explore broadly: grep for related code, find similar patterns, understand
+  architecture and data flow.
+- Ask clarifying questions when requirements are ambiguous.
+- Identify risks, edge cases, dependencies, and testing needs.
+
+**Expected output:**
+Create a structured numbered plan under a "## Plan" header:
+
+## Plan
+1. **Step one** — what to change, why, and potential risks
+2. **Step two** — files to modify, approach
+3. **Step three** — tests or validation needed
+
+**Do NOT make any changes.** When your plan is ready, the user will switch to
+Build mode to implement it.`;
+
+// ─── Build Mode System Prompt ─────────────────────────────────────────────
+
+const BUILD_SYSTEM_PROMPT = `You are in **BUILD MODE** — implementation and execution.
+
+**Your role:** Implement the plan with focused, correct changes. You have full
+tool access including edit, write, and bash.
+
+**Rules:**
+- Keep scope tight. Do exactly what was asked, no more.
+- Read files before editing to understand current state.
+- Make surgical edits. Prefer edit over write for existing files.
+- Explain your reasoning briefly before each change.
+- Run tests or type checks after changes if the project supports them.
+- If you encounter unexpected complexity, STOP and explain rather than
+  hacking around it.
+
+**After completing changes:**
+- Summarize what was done.
+- Note any follow-up work or tests that should be added.`;
+
+// ─── Type Guards ──────────────────────────────────────────────────────────
+
+function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
+	return m.role === "assistant" && Array.isArray(m.content);
+}
+
+function getTextContent(message: AssistantMessage): string {
+	return message.content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────
+
+interface ModeConfig {
+	/** Provider/model string like "opencode/deepseek-v4-flash-free" */
+	model?: string;
+	/** Thinking level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" */
+	thinkingLevel?: string;
+}
+
+interface OpenCodeModesConfig {
+	plan?: ModeConfig;
+	build?: ModeConfig;
+}
+
+function loadConfig(cwd: string): OpenCodeModesConfig {
+	const configs: OpenCodeModesConfig[] = [];
+
+	// User global config (lowest priority)
+	if (existsSync(USER_CONFIG_FILE)) {
+		try {
+			const raw = readFileSync(USER_CONFIG_FILE, "utf-8");
+			configs.push(JSON.parse(raw));
+		} catch {
+			// ignore malformed config
+		}
+	}
+
+	// Project-local config (highest priority)
+	const projectConfig = join(cwd, CONFIG_DIR_NAME, PROJECT_CONFIG_NAME);
+	if (existsSync(projectConfig)) {
+		try {
+			const raw = readFileSync(projectConfig, "utf-8");
+			configs.push(JSON.parse(raw));
+		} catch {
+			// ignore malformed config
+		}
+	}
+
+	// Merge: later configs override earlier ones
+	const merged: OpenCodeModesConfig = {};
+	for (const c of configs) {
+		if (c.plan) merged.plan = { ...merged.plan, ...c.plan };
+		if (c.build) merged.build = { ...merged.build, ...c.build };
+	}
+	return merged;
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────
+
+function uniqueTools(tools: string[]): string[] {
+	return [...new Set(tools)];
+}
+
+function getPlanTools(activeTools: string[]): string[] {
+	return uniqueTools([
+		...activeTools.filter((name) => !WRITE_TOOLS.has(name)),
+		...PLAN_TOOLS,
+	]);
+}
+
+function getBuildTools(activeTools: string[]): string[] {
+	return uniqueTools([
+		...BUILD_TOOLS,
+		...activeTools.filter((name) => !MANAGED_TOOLS.has(name)),
+	]);
+}
+
+// ─── Extension ────────────────────────────────────────────────────────────
+
+export default function openCodeModes(pi: ExtensionAPI): void {
+	let currentMode: Mode = MODE_BUILD;
+	let toolsBeforeMode: string[] | undefined;
+	let config: OpenCodeModesConfig = {};
+
+	// ── Flag ────────────────────────────────────────────────────────────────
+
+	pi.registerFlag("mode", {
+		description: 'Start in a specific mode: "plan" or "build" (default)',
+		type: "string",
+		default: "build",
+	});
+
+	// ── Status Updates ──────────────────────────────────────────────────────
+
+	function updateStatus(ctx: ExtensionContext): void {
+		if (currentMode === MODE_PLAN) {
+			ctx.ui.setStatus(
+				"opencode-mode",
+				ctx.ui.theme.fg("warning", "⏸ PLAN"),
+			);
+		} else {
+			ctx.ui.setStatus(
+				"opencode-mode",
+				ctx.ui.theme.fg("success", "▶ BUILD"),
+			);
+		}
+	}
+
+	// ── Tool Management ─────────────────────────────────────────────────────
+
+	function applyPlanTools(): void {
+		if (toolsBeforeMode === undefined) {
+			toolsBeforeMode = pi.getActiveTools();
+		}
+		pi.setActiveTools(getPlanTools(toolsBeforeMode));
+	}
+
+	function applyBuildTools(): void {
+		pi.setActiveTools(
+			toolsBeforeMode ?? getBuildTools(pi.getActiveTools()),
+		);
+		toolsBeforeMode = undefined;
+	}
+
+	// ── State Persistence ───────────────────────────────────────────────────
+
+	function persistState(): void {
+		pi.appendEntry("opencode-mode-state", {
+			mode: currentMode,
+			toolsBeforeMode,
+		});
+	}
+
+	// ── Model Switching ──────────────────────────────────────────────────────
+
+	async function applyModeModel(mode: Mode, ctx: ExtensionContext): Promise<void> {
+		const modeConfig = mode === MODE_PLAN ? config.plan : config.build;
+		if (!modeConfig) return;
+
+		// Switch model if configured
+		if (modeConfig.model) {
+			const parts = modeConfig.model.split("/", 2);
+			const provider = parts[0];
+			const modelId = parts[1] ?? parts[0];
+
+			const model = ctx.modelRegistry.find(provider, modelId);
+			if (model) {
+				const success = await pi.setModel(model);
+				if (!success) {
+					ctx.ui.notify(
+						`No API key available for ${modeConfig.model} (${mode} mode)`,
+						"error",
+					);
+				}
+			} else {
+				ctx.ui.notify(
+					`Model "${modeConfig.model}" not found for ${mode} mode`,
+					"error",
+				);
+			}
+		}
+
+		// Switch thinking level if configured
+		if (modeConfig.thinkingLevel) {
+			pi.setThinkingLevel(modeConfig.thinkingLevel as any);
+		}
+	}
+
+	// ── Mode Switch ─────────────────────────────────────────────────────────
+
+	async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
+		if (mode === currentMode) return;
+
+		currentMode = mode;
+
+		if (mode === MODE_PLAN) {
+			applyPlanTools();
+			ctx.ui.notify("⏸ Plan mode — read-only analysis. Write tools disabled.");
+		} else {
+			applyBuildTools();
+			ctx.ui.notify("▶ Build mode — full tool access for implementation.");
+		}
+
+		await applyModeModel(mode, ctx);
+		updateStatus(ctx);
+		persistState();
+	}
+
+	function toggleMode(ctx: ExtensionContext): void {
+		setMode(currentMode === MODE_PLAN ? MODE_BUILD : MODE_PLAN, ctx);
+	}
+
+	// ── System Prompt Injection ─────────────────────────────────────────────
+
+	pi.on("before_agent_start", async () => {
+		const prompt = currentMode === MODE_PLAN
+			? PLAN_SYSTEM_PROMPT
+			: BUILD_SYSTEM_PROMPT;
+
+		return {
+			message: {
+				customType: "opencode-mode-context",
+				content: prompt,
+				display: false,
+			},
+		};
+	});
+
+	// ── Tool Call Filtering (Plan mode only) ────────────────────────────────
+
+	pi.on("tool_call", async (event) => {
+		if (currentMode !== MODE_PLAN) return;
+
+		// Block write tools
+		if (WRITE_TOOLS.has(event.toolName)) {
+			return {
+				block: true,
+				reason: `Plan mode: "${event.toolName}" is disabled. Use SHIFT+TAB or /build to switch to Build mode.`,
+			};
+		}
+
+		// Block destructive bash commands
+		if (event.toolName === "bash") {
+			const command = event.input.command as string;
+			const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
+			if (isDestructive) {
+				return {
+					block: true,
+					reason: `Plan mode: destructive bash command blocked. Switch to Build mode (SHIFT+TAB or /build) to make changes.\nCommand: ${command}`,
+				};
+			}
+		}
+	});
+
+	// ── Clean up stale mode context when not active ─────────────────────────
+
+	pi.on("context", async (event) => {
+		return {
+			messages: event.messages.filter((m) => {
+				const msg = m as AgentMessage & { customType?: string };
+				if (msg.customType === "opencode-mode-context") return true; // Keep our own
+				if (msg.customType === "plan-mode-context") return false; // Strip old plan-mode
+				if (msg.customType === "plan-execution-context") return false;
+				if (msg.customType === "plan-complete") return false;
+				if (msg.customType === "plan-todo-list") return false;
+				if (msg.customType === "plan-mode-execute") return false;
+				return true;
+			}),
+		};
+	});
+
+	// ── Commands ────────────────────────────────────────────────────────────
+
+	pi.registerCommand("plan", {
+		description: "Switch to Plan mode (read-only analysis)",
+		handler: async (_args, ctx) => {
+			if (currentMode === MODE_PLAN) {
+				ctx.ui.notify("Already in Plan mode", "info");
+				return;
+			}
+			setMode(MODE_PLAN, ctx);
+		},
+	});
+
+	pi.registerCommand("build", {
+		description: "Switch to Build mode (full implementation)",
+		handler: async (_args, ctx) => {
+			if (currentMode === MODE_BUILD) {
+				ctx.ui.notify("Already in Build mode", "info");
+				return;
+			}
+			setMode(MODE_BUILD, ctx);
+		},
+	});
+
+	pi.registerCommand("mode", {
+		description: "Show current mode",
+		handler: async (_args, ctx) => {
+			const modeLabel = currentMode === MODE_PLAN ? "⏸ Plan" : "▶ Build";
+			ctx.ui.notify(`Current mode: ${modeLabel}`, "info");
+		},
+	});
+
+	// ── Shortcut: SHIFT+TAB ─────────────────────────────────────────────────
+
+	pi.registerShortcut(Key.shift("tab"), {
+		description: "Toggle between Plan and Build modes",
+		handler: async (ctx) => {
+			toggleMode(ctx);
+		},
+	});
+
+	// ── Session lifecycle ───────────────────────────────────────────────────
+
+	pi.on("session_start", async (_event, ctx) => {
+		// Load config
+		config = loadConfig(ctx.cwd);
+
+		// Check CLI flag
+		const flagMode = pi.getFlag("mode") as string | undefined;
+		if (flagMode === MODE_PLAN || flagMode === MODE_BUILD) {
+			currentMode = flagMode;
+		}
+
+		// Restore persisted state
+		const entries = ctx.sessionManager.getEntries();
+		const stateEntry = entries
+			.filter(
+				(e: { type: string; customType?: string }) =>
+					e.type === "custom" && e.customType === "opencode-mode-state",
+			)
+			.pop() as { data?: { mode?: Mode; toolsBeforeMode?: string[] } } | undefined;
+
+		if (stateEntry?.data) {
+			const restored = stateEntry.data;
+			if (restored.mode === MODE_PLAN || restored.mode === MODE_BUILD) {
+				currentMode = restored.mode;
+			}
+			if (restored.toolsBeforeMode) {
+				toolsBeforeMode = restored.toolsBeforeMode;
+			}
+		}
+
+		// Apply tools for current mode
+		if (currentMode === MODE_PLAN) {
+			applyPlanTools();
+		} else {
+			applyBuildTools();
+		}
+
+		// Apply per-mode model on initial load
+		if (currentMode === MODE_PLAN || currentMode === MODE_BUILD) {
+			await applyModeModel(currentMode, ctx);
+		}
+
+		updateStatus(ctx);
+	});
+}

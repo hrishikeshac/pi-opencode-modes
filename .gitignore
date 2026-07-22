@@ -1,0 +1,3 @@
+# Personal config files (user shouldn't commit their own settings)
+.DS_Store
+*.local.*
