@@ -30,39 +30,6 @@ Press **`Shift+Tab`** to switch modes.
 > ```
 > Or use the built-in `Alt+T` shortcut this extension provides.
 
-## Configuration
-
-Create `~/.pi/agent/opencode-modes.json` to set per-mode models and thinking levels:
-
-```json
-{
-  "plan": {
-    "model": "opencode/deepseek-v4-flash-free",
-    "thinkingLevel": "high"
-  },
-  "build": {
-    "model": "opencode/deepseek-v4-flash-free",
-    "thinkingLevel": "high"
-  }
-}
-```
-
-The `model` field uses the `provider/model-id` format — any registered model works:
-
-```json
-{
-  "plan": {
-    "model": "opencode/deepseek-v4-flash-free"
-  },
-  "build": {
-    "model": "anthropic/claude-sonnet-4-5",
-    "thinkingLevel": "high"
-  }
-}
-```
-
-Project-local configs at `.pi/opencode-modes.json` merge on top of the global one, so you can override models per repository.
-
 ## Usage
 
 | Action | Command / Shortcut |
@@ -76,9 +43,30 @@ Project-local configs at `.pi/opencode-modes.json` merge on top of the global on
 | Show thinking level | `/thinking` (no args) |
 | Start in Plan mode | `pi --mode plan` |
 
-### Model persistence
+### Persistence
 
-When you manually change the model in a mode (via `/model` or model cycling), that choice is remembered. Switching modes and back restores your previous model selection for each mode. Selections survive session restarts.
+Model (`/model`) and thinking level (`Alt+T` / `/thinking`) choices are remembered per mode. Switching modes and back restores your previous selections. Selections survive session restarts. You can skip config files entirely and just use interactive commands.
+
+## Optional: Initial defaults per mode
+
+If you want different starting model/thinking level the first time you enter each mode, create `~/.pi/agent/opencode-modes.json`:
+
+```json
+{
+  "plan": {
+    "model": "opencode/deepseek-v4-flash-free",
+    "thinkingLevel": "high"
+  },
+  "build": {
+    "model": "anthropic/claude-sonnet-4-5",
+    "thinkingLevel": "low"
+  }
+}
+```
+
+Once you change model or thinking level interactively (`/model`, `Alt+T`, `/thinking`), that choice sticks and overrides the config. You can skip this file entirely.
+
+Project-local configs at `.pi/opencode-modes.json` merge on top of the global one.
 
 ## How it works
 
