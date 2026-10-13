@@ -23,17 +23,22 @@
  *     }
  *   }
  *
+ * Config values are applied at session start, so editing the file takes effect
+ * on the next session. Within a session, /think, ALT+T and model changes win.
+ *
  * Usage:
  *   SHIFT+TAB — toggle between Plan and Build modes
+ *   ALT+M     — toggle alias (terminals that forward Option/Meta only)
  *   /plan     — switch to Plan mode
  *   /build    — switch to Build mode
  *   /mode     — show current mode
+ *   /think    — set thinking level (off/minimal/low/medium/high/xhigh/max)
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Key, type AutocompleteItem } from "@earendil-works/pi-tui";
@@ -48,19 +53,24 @@ type Mode = typeof MODE_PLAN | typeof MODE_BUILD;
 const USER_CONFIG_FILE = join(getAgentDir(), "opencode-modes.json");
 const PROJECT_CONFIG_NAME = "opencode-modes.json";
 
-// Tools available in each mode
-const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "subagent"];
+// Tools available in each mode.
+// "subagent" is deliberately absent from PLAN_TOOLS: it spawns a separate pi
+// process with its own (write-capable) tools, which this extension cannot gate.
+const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
 const BUILD_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent"];
 
-// Write tools blocked in Plan mode
-const WRITE_TOOLS = new Set(["edit", "write"]);
+// Tools blocked in Plan mode.
+// "subagent" must be listed here as well as omitted from PLAN_TOOLS: a tool that
+// is already active survives the filter below, so omission alone would not
+// disable it when arriving from Build mode.
+const PLAN_MODE_BLOCKED_TOOLS = new Set(["edit", "write", "subagent"]);
 
 // All tools this extension manages (so we don't interfere with custom tools)
 const MANAGED_TOOLS = new Set([...PLAN_TOOLS, ...BUILD_TOOLS]);
 
-// Thinking level cycle order (skipping minimal and max for quick toggling)
-const THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh"] as const;
-type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+// Full ladder accepted by /think (same order pi uses internally)
+const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type ThinkingLevel = (typeof ALL_THINKING_LEVELS)[number];
 
 // Destructive bash patterns blocked in Plan mode
 const DESTRUCTIVE_PATTERNS = [
@@ -72,11 +82,13 @@ const DESTRUCTIVE_PATTERNS = [
 	/\btouch\b/i,
 	/\bchmod\b/i,
 	/\bchown\b/i,
+	/\bchgrp\b/i,
+	/\bln\b/i,
 	/\btee\b/i,
 	/\btruncate\b/i,
 	/\bdd\b/i,
 	/\bshred\b/i,
-	/(^|[^<])>(?!>)/,
+	/(^|[\s\d;|&])>(?!>|&)/, // redirect to file (not "->", "=>" or "2>&1")
 	/>>/,
 	/\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
 	/\byarn\s+(add|remove|install|publish)/i,
@@ -84,7 +96,7 @@ const DESTRUCTIVE_PATTERNS = [
 	/\bpip\s+(install|uninstall)/i,
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
 	/\bbrew\s+(install|uninstall|upgrade)/i,
-	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
+	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|restore|clean|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
 	/\bsudo\b/i,
 	/\bsu\b/i,
 	/\bkill\b/i,
@@ -95,7 +107,39 @@ const DESTRUCTIVE_PATTERNS = [
 	/\bsystemctl\s+(start|stop|restart|enable|disable)/i,
 	/\bservice\s+\S+\s+(start|stop|restart)/i,
 	/\b(vim?|nano|emacs|code|subl)\b/i,
+	/\bfind\b[^|;]*-delete\b/i,
+	/\bsed\b[^|;]*-i\b/i,
+	/\|\s*(sudo\s+)?(sh|bash|zsh|dash|ksh|python[0-9.]*|node|perl|ruby|php)\b/i,
 ];
+
+// Read-only allowlist for Plan mode. A command must match one of these AND
+// match no destructive pattern above; anything else is denied. This is a
+// guardrail against accidents, not a security sandbox.
+const SAFE_PATTERNS = [
+	/^\s*cat\b/, /^\s*head\b/, /^\s*tail\b/, /^\s*less\b/, /^\s*more\b/,
+	/^\s*grep\b/, /^\s*find\b/, /^\s*ls\b/, /^\s*pwd\b/, /^\s*echo\b/,
+	/^\s*printf\b/, /^\s*wc\b/, /^\s*sort\b/, /^\s*uniq\b/, /^\s*diff\b/,
+	/^\s*file\b/, /^\s*stat\b/, /^\s*du\b/, /^\s*df\b/, /^\s*tree\b/,
+	/^\s*which\b/, /^\s*whereis\b/, /^\s*type\b/, /^\s*env\b/, /^\s*printenv\b/,
+	/^\s*uname\b/, /^\s*whoami\b/, /^\s*id\b/, /^\s*date\b/, /^\s*cal\b/,
+	/^\s*uptime\b/, /^\s*ps\b/, /^\s*top\b/, /^\s*htop\b/, /^\s*free\b/,
+	/^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get)/i,
+	/^\s*git\s+ls-/i,
+	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
+	/^\s*yarn\s+(list|info|why|audit)/i,
+	/^\s*node\s+--version/i,
+	/^\s*python\s+--version/i,
+	/^\s*curl\s/i,
+	/^\s*wget\s+-O\s*-/i,
+	/^\s*jq\b/, /^\s*sed\s+-n/i, /^\s*awk\b/, /^\s*rg\b/, /^\s*fd\b/,
+	/^\s*bat\b/, /^\s*eza\b/,
+];
+
+function isSafeCommand(command: string): boolean {
+	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
+	const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+	return !isDestructive && isSafe;
+}
 
 // ─── Plan Mode System Prompt ──────────────────────────────────────────────
 
@@ -125,18 +169,25 @@ Create a structured numbered plan under a "## Plan" header:
 **Do NOT make any changes.** When your plan is ready, the user will switch to
 Build mode to implement it.`;
 
-// ─── Type Guards ──────────────────────────────────────────────────────────
+// ─── Build Mode System Prompt ─────────────────────────────────────────────
 
-function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
-	return m.role === "assistant" && Array.isArray(m.content);
-}
+const BUILD_SYSTEM_PROMPT = `You are in **BUILD MODE** — implementation and execution.
 
-function getTextContent(message: AssistantMessage): string {
-	return message.content
-		.filter((block): block is TextContent => block.type === "text")
-		.map((block) => block.text)
-		.join("\n");
-}
+**Your role:** Implement the plan with focused, correct changes. You have full
+tool access including edit, write, and bash.
+
+**Rules:**
+- Keep scope tight. Do exactly what was asked, no more.
+- Read files before editing to understand current state.
+- Make surgical edits. Prefer edit over write for existing files.
+- Explain your reasoning briefly before each change.
+- Run tests or type checks after changes if the project supports them.
+- If you encounter unexpected complexity, STOP and explain rather than
+  hacking around it.
+
+**After completing changes:**
+- Summarize what was done.
+- Note any follow-up work or tests that should be added.`;
 
 // ─── Config ───────────────────────────────────────────────────────────────
 
@@ -191,9 +242,17 @@ function uniqueTools(tools: string[]): string[] {
 	return [...new Set(tools)];
 }
 
+// Split "provider/modelId" on the FIRST slash only, so ids that themselves
+// contain slashes (e.g. "openrouter/anthropic/claude-sonnet") survive intact.
+function splitModelId(ref: string): { provider: string; modelId: string } {
+	const i = ref.indexOf("/");
+	if (i === -1) return { provider: ref, modelId: ref };
+	return { provider: ref.slice(0, i), modelId: ref.slice(i + 1) };
+}
+
 function getPlanTools(activeTools: string[]): string[] {
 	return uniqueTools([
-		...activeTools.filter((name) => !WRITE_TOOLS.has(name)),
+		...activeTools.filter((name) => !PLAN_MODE_BLOCKED_TOOLS.has(name)),
 		...PLAN_TOOLS,
 	]);
 }
@@ -223,6 +282,15 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 	// Flag to distinguish config-driven thinking level changes from user-driven ones
 	let _applyingConfigThinking = false;
+
+	// What each mode *asked* for (never clamped) so the status can show clamping.
+	// modeThinkingLevels holds the effective level; this holds the request.
+	const modeThinkingRequests: Partial<Record<Mode, string>> = {};
+
+	// What the model actually did on the last assistant message. pi reports the level
+	// it requested; this reports observed thinking output, so "high (no thinking
+	// emitted)" and "off (emitting thinking)" become visible instead of guessed.
+	let lastThinkingObserved: "unknown" | "thinking" | "silent" = "unknown";
 
 	// ── Flag ────────────────────────────────────────────────────────────────
 
@@ -283,9 +351,7 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 		// Switch model if configured
 		if (modeConfig.model) {
-			const parts = modeConfig.model.split("/", 2);
-			const provider = parts[0];
-			const modelId = parts[1] ?? parts[0];
+			const { provider, modelId } = splitModelId(modeConfig.model);
 
 			const model = ctx.modelRegistry.find(provider, modelId);
 			if (model) {
@@ -308,6 +374,7 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 		// Switch thinking level if configured
 		if (modeConfig.thinkingLevel) {
+			modeThinkingRequests[mode] = modeConfig.thinkingLevel;
 			_applyingConfigThinking = true;
 			pi.setThinkingLevel(modeConfig.thinkingLevel as any);
 			_applyingConfigThinking = false;
@@ -316,9 +383,34 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 	// ── Mode Switch ─────────────────────────────────────────────────────────
 
-	async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
-		if (mode === currentMode) return;
+	// Model switches are async, so a rapid double-toggle would otherwise start
+	// two overlapping switches and leave the live model out of sync with the
+	// mode shown in the status line. Serialise them instead, coalescing any
+	// toggle that arrives mid-switch so the last request always wins.
+	let switching = false;
+	let pendingMode: Mode | undefined;
 
+	async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
+		if (switching) {
+			pendingMode = mode;
+			return;
+		}
+		switching = true;
+		try {
+			let target: Mode | undefined = mode;
+			while (target !== undefined) {
+				// Skip a request that the in-flight switch already landed on.
+				if (target !== currentMode) await applyMode(target, ctx);
+				target = pendingMode;
+				pendingMode = undefined;
+			}
+		} finally {
+			switching = false;
+			pendingMode = undefined;
+		}
+	}
+
+	async function applyMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
 		// Save departing mode's current model and thinking level
 		if (ctx.model) {
 			modeModels[currentMode] = `${ctx.model.provider}/${ctx.model.id}`;
@@ -338,7 +430,7 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		// Restore model for arriving mode, or apply config default
 		const storedModelId = modeModels[mode];
 		if (storedModelId) {
-			const [provider, modelId] = storedModelId.split("/", 2);
+			const { provider, modelId } = splitModelId(storedModelId);
 			const model = ctx.modelRegistry.find(provider, modelId);
 			if (model) {
 				await pi.setModel(model);
@@ -357,17 +449,16 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 		// Restore thinking level for arriving mode, or apply config default
 		const storedThinking = modeThinkingLevels[mode];
+		const modeConfig = mode === MODE_PLAN ? config.plan : config.build;
+		if (modeConfig?.thinkingLevel) modeThinkingRequests[mode] = modeConfig.thinkingLevel;
 		if (storedThinking) {
 			_applyingConfigThinking = true;
 			pi.setThinkingLevel(storedThinking as any);
 			_applyingConfigThinking = false;
-		} else {
-			const modeConfig = mode === MODE_PLAN ? config.plan : config.build;
-			if (modeConfig?.thinkingLevel) {
-				_applyingConfigThinking = true;
-				pi.setThinkingLevel(modeConfig.thinkingLevel as any);
-				_applyingConfigThinking = false;
-			}
+		} else if (modeConfig?.thinkingLevel) {
+			_applyingConfigThinking = true;
+			pi.setThinkingLevel(modeConfig.thinkingLevel as any);
+			_applyingConfigThinking = false;
 		}
 		// Always save what was actually set for this mode
 		modeThinkingLevels[mode] = pi.getThinkingLevel();
@@ -377,22 +468,21 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		persistState();
 	}
 
-	function toggleMode(ctx: ExtensionContext): void {
-		setMode(currentMode === MODE_PLAN ? MODE_BUILD : MODE_PLAN, ctx);
+	async function toggleMode(ctx: ExtensionContext): Promise<void> {
+		await setMode(currentMode === MODE_PLAN ? MODE_BUILD : MODE_PLAN, ctx);
 	}
 
 	// ── System Prompt Injection ─────────────────────────────────────────────
 
-	pi.on("before_agent_start", async () => {
-		if (currentMode !== MODE_PLAN) return; // Build mode = Pi's natural state, no extra prompt
+	pi.on("before_agent_start", async (event) => {
+		const prompt = currentMode === MODE_PLAN
+			? PLAN_SYSTEM_PROMPT
+			: BUILD_SYSTEM_PROMPT;
 
-		return {
-			message: {
-				customType: "opencode-mode-context",
-				content: PLAN_SYSTEM_PROMPT,
-				display: false,
-			},
-		};
+		// Append to this turn's system prompt instead of injecting a persistent
+		// message: nothing is written to the session, so repeated turns cannot
+		// accumulate copies of the mode prompt in the context.
+		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
 	});
 
 	// ── Tool Call Filtering (Plan mode only) ────────────────────────────────
@@ -401,21 +491,20 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		if (currentMode !== MODE_PLAN) return;
 
 		// Block write tools
-		if (WRITE_TOOLS.has(event.toolName)) {
+		if (PLAN_MODE_BLOCKED_TOOLS.has(event.toolName)) {
 			return {
 				block: true,
 				reason: `Plan mode: "${event.toolName}" is disabled. Use SHIFT+TAB or /build to switch to Build mode.`,
 			};
 		}
 
-		// Block destructive bash commands
+		// Bash is allowlisted: read-only commands only, deny by default.
 		if (event.toolName === "bash") {
 			const command = event.input.command as string;
-			const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
-			if (isDestructive) {
+			if (!isSafeCommand(command)) {
 				return {
 					block: true,
-					reason: `Plan mode: destructive bash command blocked. Switch to Build mode (SHIFT+TAB or /build) to make changes.\nCommand: ${command}`,
+					reason: `Plan mode: command blocked (not a read-only allowlisted command). Switch to Build mode (SHIFT+TAB or /build) to make changes.\nCommand: ${command}`,
 				};
 			}
 		}
@@ -423,20 +512,26 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 	// ── Model change tracking ──────────────────────────────────────────────
 
-	pi.on("model_select", async (event) => {
+	pi.on("model_select", async (event, ctx) => {
 		// Save user-initiated model changes (skip config-driven changes)
 		if (!_applyingConfigModel && event.model) {
 			modeModels[currentMode] = `${event.model.provider}/${event.model.id}`;
 		}
+		// The new model clamps the thinking level, and may not support thinking at all.
+		// thinking_level_select only fires when the level changes, so refresh here too.
+		lastThinkingObserved = "unknown";
+		updateThinkingStatus(ctx);
 	});
 
 	// ── Thinking level change tracking ───────────────────────────────────────
 
 	pi.on("thinking_level_select", async (event, ctx) => {
 		updateThinkingStatus(ctx);
-		// Save user-initiated changes (skip config-driven changes)
+		// Save user-initiated changes (skip config-driven changes).
+		// event.level is already clamped by pi, so request == effective here.
 		if (!_applyingConfigThinking && event.level) {
 			modeThinkingLevels[currentMode] = event.level;
+			modeThinkingRequests[currentMode] = event.level;
 		}
 	});
 
@@ -446,7 +541,9 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		return {
 			messages: event.messages.filter((m) => {
 				const msg = m as AgentMessage & { customType?: string };
-				if (msg.customType === "opencode-mode-context") return true; // Keep our own
+				// Strip mode context persisted by older versions (and any left
+				// behind in resumed sessions); we no longer inject messages.
+				if (msg.customType === "opencode-mode-context") return false;
 				if (msg.customType === "plan-mode-context") return false; // Strip old plan-mode
 				if (msg.customType === "plan-execution-context") return false;
 				if (msg.customType === "plan-complete") return false;
@@ -466,7 +563,7 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 				ctx.ui.notify("Already in Plan mode", "info");
 				return;
 			}
-			setMode(MODE_PLAN, ctx);
+			await setMode(MODE_PLAN, ctx);
 		},
 	});
 
@@ -477,7 +574,7 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 				ctx.ui.notify("Already in Build mode", "info");
 				return;
 			}
-			setMode(MODE_BUILD, ctx);
+			await setMode(MODE_BUILD, ctx);
 		},
 	});
 
@@ -492,18 +589,81 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 
 	// ── Thinking Level ──────────────────────────────────────────────────────
 
+	// Replicates pi's rule for levels a model advertises. Non-reasoning models
+	// only support "off"; xhigh/max need explicit thinkingLevelMap entries.
+	function supportedThinkingLevels(model: ExtensionContext["model"]): string[] {
+		if (!model?.reasoning) return ["off"];
+		const map = (model as { thinkingLevelMap?: Record<string, string | null | undefined> } | undefined)?.thinkingLevelMap;
+		return ALL_THINKING_LEVELS.filter((level) => {
+			const mapped = map?.[level];
+			if (mapped === null) return false;
+			if (level === "xhigh" || level === "max") return mapped !== undefined;
+			return true;
+		});
+	}
+
+	pi.on("agent_start", async () => {
+		// Reset observation for the new turn
+		lastThinkingObserved = "unknown";
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		const msg = event.message as AssistantMessage;
+		const hasThinkingBlocks = msg.content.some((b) => b.type === "thinking" && b.thinking.length > 0);
+		const reasoningTokens = ((msg.usage as { reasoning?: number } | undefined)?.reasoning ?? 0) > 0;
+		lastThinkingObserved = hasThinkingBlocks || reasoningTokens ? "thinking" : "silent";
+		updateThinkingStatus(ctx);
+	});
+
+	function thinkingStatus(ctx: ExtensionContext): string {
+		const level = pi.getThinkingLevel();
+		const supportsReasoning = !!ctx.model?.reasoning;
+		const requested = modeThinkingRequests[currentMode] ?? (currentMode === MODE_PLAN ? config.plan?.thinkingLevel : config.build?.thinkingLevel);
+		const parts: string[] = [];
+		let tone: "success" | "warning" | "dim" = level === "off" ? "dim" : "success";
+
+		if (!supportsReasoning) {
+			parts.push("🧠 off", "(model reasoning:false)");
+			tone = "warning";
+		} else {
+			parts.push(`🧠 ${level}`);
+			if (requested && requested !== level) {
+				parts.push(`⟵${requested}`);
+				tone = "warning";
+			}
+			if (level !== "off" && lastThinkingObserved === "silent") {
+				parts.push("(no thinking emitted)");
+				tone = "warning";
+			} else if (level === "off" && lastThinkingObserved === "thinking") {
+				parts.push("(model thinking anyway)");
+				tone = "warning";
+			}
+		}
+
+		const text = parts.join(" ");
+		return ctx.ui.theme.fg(tone, text);
+	}
+
 	function cycleThinking(ctx: ExtensionContext): void {
+		const levels = supportedThinkingLevels(ctx.model);
 		const current = pi.getThinkingLevel();
-		const idx = THINKING_LEVELS.indexOf(current as ThinkingLevel);
-		const next = THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length];
+		let idx = levels.indexOf(current);
+		if (idx === -1) idx = 0;
+		const next = levels[(idx + 1) % levels.length] as ThinkingLevel;
 		pi.setThinkingLevel(next);
-		ctx.ui.notify(`Thinking level: ${next}`, "info");
+		const applied = pi.getThinkingLevel();
+		if (applied !== next) {
+			ctx.ui.notify(`Thinking level requested: ${next} → clamped by model to ${applied}`, "warning");
+		} else {
+			ctx.ui.notify(`Thinking level: ${applied}`, "info");
+		}
 		updateThinkingStatus(ctx);
 	}
 
 	function updateThinkingStatus(ctx: ExtensionContext): void {
-		const level = pi.getThinkingLevel();
-		ctx.ui.setStatus("opencode-thinking", `🧠 ${level}`);
+		if (!ctx.hasUI) return;
+		ctx.ui.setStatus("opencode-thinking", thinkingStatus(ctx));
 	}
 
 	pi.registerShortcut("alt+t", {
@@ -513,10 +673,10 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerCommand("thinking", {
-		description: "Set thinking level (off/low/medium/high/xhigh) or show current",
+	pi.registerCommand("think", {
+		description: "Set thinking level (off/minimal/low/medium/high/xhigh/max) or show current status",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-			const items = THINKING_LEVELS.map((l) => ({
+			const items = ALL_THINKING_LEVELS.map((l) => ({
 				value: l,
 				label: l,
 			}));
@@ -525,23 +685,44 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 			return filtered.length > 0 ? filtered : null;
 		},
 		handler: async (args, ctx) => {
-			if (!args || !(THINKING_LEVELS as readonly string[]).includes(args)) {
-				ctx.ui.notify(`Current thinking level: ${pi.getThinkingLevel()}`, "info");
+			if (!args || !(ALL_THINKING_LEVELS as readonly string[]).includes(args)) {
+				const current = pi.getThinkingLevel();
+				const requested = modeThinkingRequests[currentMode] ?? "none";
+				const supported = supportedThinkingLevels(ctx.model).join("/");
+				const reasoningFlag = ctx.model?.reasoning ? "true" : "false";
+				ctx.ui.notify(
+					`Thinking level: ${current} (requested: ${requested}) | Model supported: ${supported} (reasoning: ${reasoningFlag}) | Last turn observed: ${lastThinkingObserved}`,
+					"info",
+				);
 				return;
 			}
 			pi.setThinkingLevel(args as ThinkingLevel);
-			ctx.ui.notify(`Thinking level: ${args}`, "info");
+			const applied = pi.getThinkingLevel();
+			if (applied !== args) {
+				ctx.ui.notify(`Requested thinking level "${args}" → model clamped to "${applied}"`, "warning");
+			} else {
+				ctx.ui.notify(`Thinking level set to: ${applied}`, "info");
+			}
 			updateThinkingStatus(ctx);
 		},
 	});
 
 	// ── Shortcut: SHIFT+TAB ─────────────────────────────────────────────────
 
+	// SHIFT+TAB is the primary binding. Pi binds shift+tab to app.thinking.cycle
+	// by default, so rebind that first (see README). ALT+M is registered as an
+	// alias because many terminals never forward Option/Meta (on macOS Option+M
+	// is "µ"), so it cannot be relied on as the primary.
+	const toggleModeShortcut = async (ctx: ExtensionContext): Promise<void> => {
+		await toggleMode(ctx);
+	};
 	pi.registerShortcut(Key.shift("tab"), {
 		description: "Toggle between Plan and Build modes",
-		handler: async (ctx) => {
-			toggleMode(ctx);
-		},
+		handler: toggleModeShortcut,
+	});
+	pi.registerShortcut("alt+m", {
+		description: "Toggle between Plan and Build modes (alias)",
+		handler: toggleModeShortcut,
 	});
 
 	// ── Session lifecycle ───────────────────────────────────────────────────
@@ -603,45 +784,34 @@ export default function openCodeModes(pi: ExtensionAPI): void {
 			applyBuildTools();
 		}
 
-		// Apply per-mode model on initial load
-		if (currentMode === MODE_PLAN || currentMode === MODE_BUILD) {
+		// Apply per-mode model and thinking level on initial load.
+		//
+		// The config file wins at session start, so editing it takes effect on
+		// the next session; persisted state is only a fallback for modes the
+		// config does not mention. Within a session, /think, ALT+T and model
+		// changes still win and are remembered across mode switches.
+		const modeConfig = currentMode === MODE_PLAN ? config.plan : config.build;
+
+		if (modeConfig?.model) {
+			await applyModeModel(currentMode, ctx);
+		} else {
 			const storedModelId = modeModels[currentMode];
 			if (storedModelId && ctx.modelRegistry) {
-				const [provider, modelId] = storedModelId.split("/", 2);
+				const { provider, modelId } = splitModelId(storedModelId);
 				const model = ctx.modelRegistry.find(provider, modelId);
 				if (model) {
 					_applyingConfigModel = true;
 					await pi.setModel(model);
 					_applyingConfigModel = false;
-				} else {
-					// Stored model no longer available — apply config default
-					await applyModeModel(currentMode, ctx);
 				}
-			} else {
-				await applyModeModel(currentMode, ctx);
-			}
-
-			// Always save what was actually set for this mode
-			if (ctx.model) {
-				modeModels[currentMode] = `${ctx.model.provider}/${ctx.model.id}`;
 			}
 		}
 
-		// Apply per-mode thinking level on initial load
-		if (currentMode === MODE_PLAN || currentMode === MODE_BUILD) {
-			const storedThinking = modeThinkingLevels[currentMode];
-			if (storedThinking) {
-				_applyingConfigThinking = true;
-				pi.setThinkingLevel(storedThinking as any);
-				_applyingConfigThinking = false;
-			} else {
-				const modeConfig = currentMode === MODE_PLAN ? config.plan : config.build;
-				if (modeConfig?.thinkingLevel) {
-					_applyingConfigThinking = true;
-					pi.setThinkingLevel(modeConfig.thinkingLevel as any);
-					_applyingConfigThinking = false;
-				}
-			}
+		const thinkingToApply = modeConfig?.thinkingLevel ?? modeThinkingLevels[currentMode];
+		if (thinkingToApply) {
+			_applyingConfigThinking = true;
+			pi.setThinkingLevel(thinkingToApply as any);
+			_applyingConfigThinking = false;
 		}
 
 		updateStatus(ctx);
