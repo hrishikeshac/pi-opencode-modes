@@ -1,6 +1,6 @@
 # Pi OpenCode Modes
 
-Toggle between **Plan mode** (read-only analysis) and **Build mode** (full implementation) in [Pi](https://github.com/earendil-works/pi-coding-agent), inspired by OpenCode's Plan/Build workflow.
+Toggle between **Plan mode** (read-only analysis) and **Build mode** (full implementation) in [Pi](https://github.com/earendil-works/pi), inspired by OpenCode's Plan/Build workflow.
 
 Press **`Shift+Tab`** to switch modes. (`Alt+M` is also registered, but many terminals never forward Option/Meta — on macOS Option+M types `µ` — so it is only a convenience alias.)
 
@@ -90,4 +90,4 @@ The Plan mode bash filter is a **guardrail against accidents, not a security san
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

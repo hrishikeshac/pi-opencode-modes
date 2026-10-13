@@ -1,3 +1,19 @@
-# Personal config files (user shouldn't commit their own settings)
+# OS / editor cruft
 .DS_Store
+*.swp
+
+# Logs and build output
+*.log
+node_modules/
+
+# Local overrides and secrets — never commit
 *.local.*
+.env
+.env.*
+
+# Personal Pi config. This holds per-mode model ids and thinking levels that
+# are specific to one machine, so it must never be committed. The extension
+# reads it from ~/.pi/agent/opencode-modes.json (global) and
+# .pi/opencode-modes.json (project-local), and both names are ignored here.
+opencode-modes.json
+.pi/
